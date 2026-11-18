@@ -16,8 +16,14 @@ struct CodexCatalogTemplate {
     instructions: serde_json::Map<String, Value>,
 }
 
-const OPENAI_INSTRUCTION_PROFILES: [&str; 4] =
-    ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"];
+const OPENAI_INSTRUCTION_PROFILES: [&str; 6] = [
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
+];
 const OPENAI_FALLBACK_PROFILE: &str = "gpt-6-astra";
 
 /// Get Codex configuration directory path
@@ -168,7 +174,15 @@ fn codex_catalog_model_entry(
     entry_obj.insert("model_messages".into(), messages.clone());
 
     let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
-    let context_window = spec.context_window.unwrap_or(default_context_window);
+    let advertised_input_limit = spec.context_window.unwrap_or(default_context_window);
+    let context_window = spec
+        .max_context_window
+        .zip(spec.max_output_tokens)
+        .and_then(|(total, output)| total.checked_sub(output))
+        .filter(|budget| *budget > 0)
+        .map_or(advertised_input_limit, |budget| {
+            advertised_input_limit.min(budget)
+        });
     let max_context_window = spec
         .max_context_window
         .unwrap_or(context_window)
@@ -216,6 +230,8 @@ struct CodexCatalogModelSpec {
     context_window: Option<u64>,
     /// Total context limit from Copilot capability limits.
     max_context_window: Option<u64>,
+    /// Maximum generation budget from Copilot capability limits.
+    max_output_tokens: Option<u64>,
     /// Live Copilot parallel-tool declaration.
     supports_parallel_tool_calls: Option<bool>,
     /// Live Copilot image-input declaration.
@@ -271,6 +287,7 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
             .map(str::to_string);
         let context_window = parse_codex_positive_u64(model_config.get("contextWindow"));
         let max_context_window = parse_codex_positive_u64(model_config.get("maxContextWindow"));
+        let max_output_tokens = parse_codex_positive_u64(model_config.get("maxOutputTokens"));
 
         let supports_parallel_tool_calls = model_config
             .get("supportsParallelToolCalls")
@@ -330,6 +347,7 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
             display_name,
             context_window,
             max_context_window,
+            max_output_tokens,
             supports_parallel_tool_calls,
             input_modalities,
             reasoning_levels,
@@ -574,6 +592,36 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reserves_output_space_without_raising_a_smaller_input_limit() {
+        let settings = json!({"modelCatalog":{"models":[
+            {"model":"gpt-6-astra", "contextWindow":1050000, "maxContextWindow":1050000, "maxOutputTokens":128000},
+            {"model":"gpt-6.2-astra", "contextWindow":1050000, "maxContextWindow":1050000, "maxOutputTokens":128000},
+            {"model":"gpt-6.2-sol", "contextWindow":1050000, "maxContextWindow":1050000, "maxOutputTokens":128000},
+            {"model":"gpt-6-luna", "contextWindow":872000, "maxContextWindow":1000000, "maxOutputTokens":128000},
+            {"model":"smaller-prompt-limit", "contextWindow":800000, "maxContextWindow":1000000, "maxOutputTokens":128000},
+            {"model":"missing-total", "contextWindow":32000, "maxOutputTokens":4096},
+            {"model":"inconsistent-limits", "contextWindow":24000, "maxContextWindow":32000, "maxOutputTokens":64000}
+        ]}});
+        let catalog = codex_model_catalog_from_settings(&settings, "")
+            .unwrap()
+            .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        for (entry, (input, total)) in models.iter().zip([
+            (922_000, 1_050_000),
+            (922_000, 1_050_000),
+            (922_000, 1_050_000),
+            (872_000, 1_000_000),
+            (800_000, 1_000_000),
+            (32_000, 32_000),
+            (24_000, 32_000),
+        ]) {
+            assert_eq!(entry["context_window"], input, "{}", entry["slug"]);
+            assert_eq!(entry["max_context_window"], total, "{}", entry["slug"]);
+        }
+        assert_eq!(models.len(), 7);
+    }
+
+    #[test]
     fn ultra_is_always_exposed_even_for_legacy_disabled_settings() {
         let models = json!([
             {"model":"reasoning", "reasoningLevels":["low","high"], "supportedReasoningLevels":["low","high","max"]},
@@ -675,6 +723,8 @@ mod tests {
             ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-6.1-sol", "gpt-6.1-sol"),
             ("GPT-6.1-SOL", "gpt-6.1-sol"),
+            ("gpt-6.2-astra", "gpt-6.2-astra"),
+            ("GPT-6.2-SOL", "gpt-6.2-sol"),
             ("gemini-3.8-flash", "gpt-6-astra"),
             ("grok-4.7", "gpt-6-astra"),
             ("gpt-5.5", "gpt-6-astra"),
@@ -721,25 +771,33 @@ mod tests {
             serde_json::from_str(include_str!("resources/openai-codex-instructions.json")).unwrap();
         assert_eq!(
             snapshot["source"]["commit"],
-            "83086188ae0614bd882818ff1aa23f3194962012"
+            "c376cf7396eff83ce4c6ac61b9553df142e7a0be"
         );
         assert_eq!(snapshot["fallbackModel"], OPENAI_FALLBACK_PROFILE);
         for (slug, expected) in [
             (
                 "gpt-6-astra",
-                "35bd51b5f577cb7b24cd5f4629e49e37cb724ab57754ce6f8f202001635bab8a",
+                "4ddce5803b638f01342f657002289d1307634c677df840eeefdd4bc5b451276d",
             ),
             (
                 "gpt-6-luna",
-                "b707476816bfe5e571a1bd2179f130fff2b132da5ab8e61063acdb7fd24daf12",
+                "e52174f354e3970ad8de5935fff8d04ddf2890a35659283d163befb56490198c",
             ),
             (
                 "gpt-6-sol",
-                "b1dd8718c037906c53a305c5cbccb4a4be35ccbb7837461ec349bfc495412f0d",
+                "a8567d97e0fb03f19942650430e0905fd2e092f102e8d98c03fc1b89995619c2",
             ),
             (
                 "gpt-6.1-sol",
-                "e1bdd4f8f0df4b20f4a0ffc8a861ce819df45325d8cecdfb92e80379cf8d142e",
+                "d12e6dbdfd4a4ddb26a1f6048b69a32b8b32f74e4add9791d1dff7f4cac0b032",
+            ),
+            (
+                "gpt-6.2-astra",
+                "aa47d2dee261594c4944241b646088730d74d87afa4da8d2da0554540a5e7623",
+            ),
+            (
+                "gpt-6.2-sol",
+                "aa47d2dee261594c4944241b646088730d74d87afa4da8d2da0554540a5e7623",
             ),
         ] {
             let profile = &snapshot["models"][slug];
